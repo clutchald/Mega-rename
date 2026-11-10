@@ -1,5 +1,4 @@
-
-# Git
+# Git files
 .git/
 .gitignore
 
@@ -17,7 +16,7 @@ venv/
 .venv/
 env/
 
-# Local databases and data
+# Local databases
 *.sqlite3
 *.db
 data/
@@ -39,5 +38,12 @@ Thumbs.db
 *.tmp
 *.bak
 
-# Documentation
-README.md
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Archives
+*.zip
+*.tar
+*.gz
