@@ -1,5 +1,5 @@
 
-# Environment secrets
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
@@ -7,14 +7,14 @@
 # Python cache
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
 
-# Virtual environment
+# Virtual environments
 venv/
 .venv/
 env/
 
-# Database and local data
+# Local databases
 *.sqlite3
 *.db
 data/
@@ -35,3 +35,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# Build files
+build/
+dist/
+*.egg-info/
