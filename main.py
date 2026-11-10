@@ -1,9 +1,10 @@
-import os, re, logging, asyncio
+import os, re, logging, asyncio, signal
 from pathlib import Path
 from functools import partial
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           ConversationHandler, ContextTypes, filters)
+from aiohttp import web
 from mega import Mega
 from pymongo import MongoClient
 
@@ -16,6 +17,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "mega_renamer_bot").strip()
+PORT = int(os.getenv("PORT", "8000"))
 mongo_client = None
 mongo_db = None
 
@@ -336,37 +338,101 @@ async def help_cmd(update, context):
         "/prefix, /suffix, /replace — reserved commands\\n/cancel — cancel current input\\n\\n"
         "Bulk mode scans your drive, previews the planned names, and asks for confirmation.")
 
-def main():
-    if not BOT_TOKEN or not ADMIN_ID:
-        raise SystemExit("Set BOT_TOKEN and ADMIN_ID environment variables.")
-    init_mongodb()
-    app=Application.builder().token(BOT_TOKEN).build()
-    login_conv=ConversationHandler(
-        entry_points=[CommandHandler("login",login_cmd)],
-        states={EMAIL:[MessageHandler(filters.TEXT & ~filters.COMMAND,login_email)],
-                PASSWORD:[MessageHandler(filters.TEXT & ~filters.COMMAND,login_password)]},
-        fallbacks=[CommandHandler("cancel",cancel)],
-        conversation_timeout=180)
-    rename_conv=ConversationHandler(
-        entry_points=[CommandHandler("rename",rename_cmd)],
-        states={RENAME_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,rename_name)]},
-        fallbacks=[CommandHandler("cancel",cancel)])
-    app.add_handler(CommandHandler("start",start))
+async def health(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "mega-renamer-bot",
+        "database": "mongodb",
+    })
+
+
+async def start_health_server():
+    health_app = web.Application()
+    health_app.router.add_get("/", health)
+    health_app.router.add_get("/health", health)
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Health server listening on 0.0.0.0:%s", PORT)
+    return runner
+
+
+def build_telegram_application():
+    app = Application.builder().token(BOT_TOKEN).build()
+    login_conv = ConversationHandler(
+        entry_points=[CommandHandler("login", login_cmd)],
+        states={
+            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)],
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        conversation_timeout=180,
+    )
+    rename_conv = ConversationHandler(
+        entry_points=[CommandHandler("rename", rename_cmd)],
+        states={RENAME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rename_name)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(login_conv)
     app.add_handler(rename_conv)
-    app.add_handler(CommandHandler("files",files_cmd))
-    app.add_handler(CommandHandler("bulk",bulk_cmd))
-    app.add_handler(CommandHandler("prefix",prefix_cmd))
-    app.add_handler(CommandHandler("suffix",suffix_cmd))
-    app.add_handler(CommandHandler("replace",replace_cmd))
-    app.add_handler(CommandHandler("search",search_cmd))
-    app.add_handler(CommandHandler("help",help_cmd))
+    app.add_handler(CommandHandler("files", files_cmd))
+    app.add_handler(CommandHandler("bulk", bulk_cmd))
+    app.add_handler(CommandHandler("prefix", prefix_cmd))
+    app.add_handler(CommandHandler("suffix", suffix_cmd))
+    app.add_handler(CommandHandler("replace", replace_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(pick_callback, pattern=r"^(pick:|refresh$)"))
     app.add_handler(CallbackQueryHandler(bulk_type_callback, pattern=r"^bulk:(both|video|image)$"))
     app.add_handler(CallbackQueryHandler(bulk_confirm_callback, pattern=r"^bulk:(confirm|cancel)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,bulk_name_message), group=1)
-    log.info("MEGA Renamer Bot starting")
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_name_message), group=1)
+    return app
+
+
+async def main():
+    if not BOT_TOKEN or not ADMIN_ID:
+        raise SystemExit("Set BOT_TOKEN and ADMIN_ID environment variables.")
+
+    # MongoDB is synchronous in this bot; initialize it before starting Telegram polling.
+    await asyncio.to_thread(init_mongodb)
+    telegram_app = build_telegram_application()
+    health_runner = None
+    polling_started = False
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
+    try:
+        await telegram_app.initialize()
+        await telegram_app.start()
+        health_runner = await start_health_server()
+        await telegram_app.updater.start_polling(drop_pending_updates=True)
+        polling_started = True
+        log.info("MEGA Renamer Bot started; health endpoint available at /health on port %s", PORT)
+        await stop_event.wait()
+    finally:
+        log.info("Shutting down MEGA Renamer Bot")
+        if polling_started:
+            await telegram_app.updater.stop()
+        if telegram_app.running:
+            await telegram_app.stop()
+        await telegram_app.shutdown()
+        if health_runner is not None:
+            await health_runner.cleanup()
+        if mongo_client is not None:
+            mongo_client.close()
+        log.info("MEGA Renamer Bot shutdown complete")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
